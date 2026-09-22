@@ -12,6 +12,7 @@ calls to the same model, and only then fails.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -29,9 +30,7 @@ def _resp(content: str | None, finish_reason: str, tool_args: str | None = None)
     """Mock httpx.Response with a chat-completions shaped payload."""
     message: dict = {"content": content}
     if tool_args is not None:
-        message["tool_calls"] = [
-            {"function": {"name": "submit_review", "arguments": tool_args}}
-        ]
+        message["tool_calls"] = [{"function": {"name": "submit_review", "arguments": tool_args}}]
     data = {
         "choices": [{"message": message, "finish_reason": finish_reason}],
     }
@@ -44,7 +43,17 @@ def _resp(content: str | None, finish_reason: str, tool_args: str | None = None)
 
 def _mock_client(responses: list[MagicMock]) -> MagicMock:
     mock_client = AsyncMock()
-    mock_client.post = AsyncMock(side_effect=responses)
+    # Snapshot the json body at call time — the provider mutates its body
+    # dict in place (e.g. on max_tokens escalation), so keeping a reference
+    # would make every recorded call look like the final state.
+    recorded_bodies: list[dict] = []
+
+    async def _post(*args: object, json: dict | None = None, **kwargs: object) -> MagicMock:
+        recorded_bodies.append(copy.deepcopy(json))
+        return responses.pop(0)
+
+    mock_client.post = AsyncMock(side_effect=_post)
+    mock_client.post_bodies = recorded_bodies
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
     cls = MagicMock()
@@ -131,13 +140,9 @@ class TestReasoningTruncationEscalation:
         cls = _mock_client([truncated, good, good])
 
         with patch("mira.llm.provider.httpx.AsyncClient", cls):
-            await provider.complete_with_tools(
-                [{"role": "user", "content": "a"}], _tools()
-            )
+            await provider.complete_with_tools([{"role": "user", "content": "a"}], _tools())
             # Subsequent call to the same model starts at the escalated budget.
-            await provider.complete_with_tools(
-                [{"role": "user", "content": "b"}], _tools()
-            )
+            await provider.complete_with_tools([{"role": "user", "content": "b"}], _tools())
 
         bodies = mock_post_bodies(cls)
         assert bodies[0]["max_tokens"] == 4096
@@ -147,5 +152,4 @@ class TestReasoningTruncationEscalation:
 
 def mock_post_bodies(cls: MagicMock) -> list[dict]:
     """Extract the json bodies from all calls made to the mocked client."""
-    client = cls.return_value
-    return [call.kwargs.get("json") or call[1].get("json") for call in client.post.await_args_list]
+    return cls.return_value.post_bodies
